@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import hmac
 import json
+import math
 import socket
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Set
+
+PASSWORD_STORE_PATH = Path("this_is_safe.txt")
+PASSWORD_RULES_PATH = Path("password_rules.json")
+DEFAULT_PASSWORD_RULES = {
+    "min_length": 12,
+    "min_lowercase": 1,
+    "min_uppercase": 1,
+    "min_digit": 1,
+    "min_symbol": 1,
+    "forbidden_substrings": [],
+}
 
 DEFAULT_PORT = 5050
 HOST = "0.0.0.0"
@@ -49,6 +64,147 @@ def pick_color(username: str) -> tuple[str, str]:
     return ANSI_COLORS[index]
 
 
+def hash_password(password: str) -> str:
+    digest = hashlib.md5(password.encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+DUMMY_PASSWORD_HASH = hash_password("")
+
+
+def estimate_password_entropy(password: str) -> float:
+    pool = 0
+    if any(char.islower() for char in password):
+        pool += 26
+    if any(char.isupper() for char in password):
+        pool += 26
+    if any(char.isdigit() for char in password):
+        pool += 10
+    if any(not char.isalnum() for char in password):
+        pool += 32
+    if pool == 0:
+        return 0.0
+    return len(password) * math.log2(pool)
+
+
+def password_strength_label(entropy_bits: float) -> str:
+    if entropy_bits < 60:
+        return "weak"
+    if entropy_bits < 90:
+        return "medium"
+    return "strong"
+
+
+@dataclass
+class PasswordRules:
+    min_length: int = 12
+    min_lowercase: int = 1
+    min_uppercase: int = 1
+    min_digit: int = 1
+    min_symbol: int = 1
+    forbidden_substrings: List[str] = field(default_factory=list)
+
+    @classmethod
+    def load(cls, path: Path) -> "PasswordRules":
+        if not path.exists():
+            path.write_text(
+                json.dumps(DEFAULT_PASSWORD_RULES, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return cls(
+            min_length=int(data.get("min_length", 12)),
+            min_lowercase=int(data.get("min_lowercase", 1)),
+            min_uppercase=int(data.get("min_uppercase", 1)),
+            min_digit=int(data.get("min_digit", 1)),
+            min_symbol=int(data.get("min_symbol", 1)),
+            forbidden_substrings=[
+                str(item).lower() for item in data.get("forbidden_substrings", []) if str(item).strip()
+            ],
+        )
+
+    def describe(self) -> List[str]:
+        rules = [
+            f"at least {self.min_length} characters",
+            f"at least {self.min_lowercase} lowercase letter(s)",
+            f"at least {self.min_uppercase} uppercase letter(s)",
+            f"at least {self.min_digit} digit(s)",
+            f"at least {self.min_symbol} symbol(s)",
+            "must not contain the username",
+        ]
+        for forbidden in self.forbidden_substrings:
+            rules.append(f"must not contain '{forbidden}'")
+        return rules
+
+    def validate(self, username: str, password: str) -> List[str]:
+        errors: List[str] = []
+        if len(password) < self.min_length:
+            errors.append(f"password must contain at least {self.min_length} characters")
+        if sum(char.islower() for char in password) < self.min_lowercase:
+            errors.append(f"password must contain at least {self.min_lowercase} lowercase letter(s)")
+        if sum(char.isupper() for char in password) < self.min_uppercase:
+            errors.append(f"password must contain at least {self.min_uppercase} uppercase letter(s)")
+        if sum(char.isdigit() for char in password) < self.min_digit:
+            errors.append(f"password must contain at least {self.min_digit} digit(s)")
+        if sum(not char.isalnum() for char in password) < self.min_symbol:
+            errors.append(f"password must contain at least {self.min_symbol} symbol(s)")
+        lowered_password = password.lower()
+        lowered_username = username.lower()
+        if lowered_username and lowered_username in lowered_password:
+            errors.append("password must not contain the username")
+        for forbidden in self.forbidden_substrings:
+            if forbidden and forbidden in lowered_password:
+                errors.append(f"password must not contain '{forbidden}'")
+        return errors
+
+
+@dataclass
+class CredentialStore:
+    path: Path
+    users: Dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def load(cls, path: Path) -> "CredentialStore":
+        if not path.exists():
+            path.write_text("", encoding="utf-8")
+        users: Dict[str, str] = {}
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            if ":" not in line:
+                raise ValueError(f"invalid credential line {line_number}: missing separator")
+            username, password_hash = line.split(":", 1)
+            username = username.strip()
+            password_hash = password_hash.strip()
+            if not username or not password_hash:
+                raise ValueError(f"invalid credential line {line_number}: empty username or hash")
+            users[username] = password_hash
+        return cls(path=path, users=users)
+
+    def save(self) -> None:
+        lines = [f"{username}:{password_hash}" for username, password_hash in sorted(self.users.items())]
+        content = "\n".join(lines)
+        if content:
+            content += "\n"
+        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        temp_path.write_text(content, encoding="utf-8")
+        temp_path.replace(self.path)
+
+    def get_hash(self, username: str) -> Optional[str]:
+        return self.users.get(username)
+
+    def set_user(self, username: str, password_hash: str) -> None:
+        self.users[username] = password_hash
+        self.save()
+
+    def authenticate(self, username: str, password: str) -> bool:
+        stored_hash = self.get_hash(username)
+        candidate_hash = hash_password(password)
+        reference_hash = stored_hash if stored_hash is not None else DUMMY_PASSWORD_HASH
+        matched = hmac.compare_digest(reference_hash, candidate_hash)
+        return stored_hash is not None and matched
+
+
 @dataclass
 class Room:
     name: str
@@ -82,6 +238,9 @@ class ChatServer:
         self.lock = threading.RLock()
         self.rooms: Dict[str, Room] = {GENERAL_ROOM: Room(GENERAL_ROOM)}
         self.sessions: Dict[str, Session] = {}
+        self.pending_auth: Set[str] = set()
+        self.password_rules = PasswordRules.load(PASSWORD_RULES_PATH)
+        self.credentials = CredentialStore.load(PASSWORD_STORE_PATH)
         self.log_path = log_name()
         self.log_file = open(self.log_path, "a", encoding="utf-8", buffering=1)
 
@@ -95,6 +254,9 @@ class ChatServer:
             line += f" - {details}"
         with self.lock:
             self.log_file.write(line + "\n")
+
+    def send_payload(self, conn: socket.socket, payload: dict) -> None:
+        conn.sendall(json_line(payload))
 
     def room_snapshot(self) -> List[dict]:
         with self.lock:
@@ -135,6 +297,17 @@ class ChatServer:
         with self.lock:
             self.sessions[session.username] = session
             self.rooms[GENERAL_ROOM].members.add(session.username)
+
+    def reserve_username(self, username: str) -> bool:
+        with self.lock:
+            if username in self.sessions or username in self.pending_auth:
+                return False
+            self.pending_auth.add(username)
+            return True
+
+    def release_username(self, username: str) -> None:
+        with self.lock:
+            self.pending_auth.discard(username)
 
     def remove_session(self, username: str) -> Optional[Session]:
         with self.lock:
@@ -181,6 +354,18 @@ class ChatServer:
         self.create_room(room_name, password)
         self.move_session(session, room_name)
         return previous_room
+
+    def auth_prompt(self, username: str, mode: str) -> dict:
+        return {
+            "type": "auth_required",
+            "timestamp": now_string(),
+            "username": username,
+            "mode": mode,
+            "policy": self.password_rules.describe(),
+        }
+
+    def auth_error(self, message: str) -> dict:
+        return {"type": "auth_error", "timestamp": now_string(), "message": message}
 
     def handle_rooms(self, session: Session) -> None:
         session.send({"type": "room_list", "timestamp": now_string(), "rooms": self.room_snapshot()})
@@ -281,6 +466,33 @@ class ChatServer:
         )
         raise ConnectionAbortedError
 
+    def welcome_payload(
+        self,
+        session: Session,
+        account_created: bool,
+        password_strength: Optional[dict] = None,
+    ) -> dict:
+        payload = {
+            "type": "welcome",
+            "timestamp": now_string(),
+            "username": session.username,
+            "room": session.room,
+            "color": session.color_code,
+            "color_name": session.color_name,
+            "message": "connected",
+            "rooms": self.room_snapshot(),
+            "help": [
+                "/rooms",
+                "/create <room> [password]",
+                "/join <room> [password]",
+                "/quit",
+            ],
+            "account_created": account_created,
+        }
+        if password_strength is not None:
+            payload["password_strength"] = password_strength
+        return payload
+
     def disconnect(self, username: str, reason: str) -> None:
         session = self.remove_session(username)
         if session is None:
@@ -303,6 +515,7 @@ class ChatServer:
 
     def register(self, conn: socket.socket, addr: tuple[str, int]) -> Optional[Session]:
         rfile = conn.makefile("r", encoding="utf-8", newline="\n")
+        username: Optional[str] = None
         try:
             raw = rfile.readline()
             if not raw:
@@ -310,33 +523,74 @@ class ChatServer:
             try:
                 payload = json.loads(raw)
             except json.JSONDecodeError:
-                conn.sendall(
-                    json_line({"type": "error", "timestamp": now_string(), "message": "invalid handshake"})
-                )
+                self.send_payload(conn, {"type": "error", "timestamp": now_string(), "message": "invalid handshake"})
                 return None
             if payload.get("type") != "hello":
-                conn.sendall(
-                    json_line({"type": "error", "timestamp": now_string(), "message": "expected hello"})
-                )
+                self.send_payload(conn, {"type": "error", "timestamp": now_string(), "message": "expected hello"})
                 return None
             username = str(payload.get("username", "")).strip()
             if not username:
-                conn.sendall(
-                    json_line({"type": "error", "timestamp": now_string(), "message": "username required"})
+                self.send_payload(conn, {"type": "error", "timestamp": now_string(), "message": "username required"})
+                return None
+            if not self.reserve_username(username):
+                self.send_payload(
+                    conn,
+                    {
+                        "type": "error",
+                        "timestamp": now_string(),
+                        "message": f"username '{username}' is already in use",
+                    },
                 )
                 return None
+
             with self.lock:
-                if username in self.sessions:
-                    conn.sendall(
-                        json_line(
-                            {
-                                "type": "error",
-                                "timestamp": now_string(),
-                                "message": f"username '{username}' is already in use",
-                            }
-                        )
-                    )
+                account_exists = self.credentials.get_hash(username) is not None
+            mode = "login" if account_exists else "register"
+            self.send_payload(conn, self.auth_prompt(username, mode))
+
+            account_created = False
+            password_strength: Optional[dict] = None
+            while True:
+                raw = rfile.readline()
+                if not raw:
                     return None
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    self.send_payload(conn, self.auth_error("invalid authentication payload"))
+                    continue
+                if payload.get("type") != "auth":
+                    self.send_payload(conn, self.auth_error("expected auth payload"))
+                    continue
+
+                password = str(payload.get("password", ""))
+                if mode == "login":
+                    with self.lock:
+                        authenticated = self.credentials.authenticate(username, password)
+                    if authenticated:
+                        break
+                    self.send_payload(conn, self.auth_error("incorrect password"))
+                    continue
+
+                confirmation = str(payload.get("confirm", ""))
+                if password != confirmation:
+                    self.send_payload(conn, self.auth_error("password confirmation does not match"))
+                    continue
+                errors = self.password_rules.validate(username, password)
+                if errors:
+                    self.send_payload(conn, self.auth_error("; ".join(errors)))
+                    continue
+                password_hash = hash_password(password)
+                with self.lock:
+                    self.credentials.set_user(username, password_hash)
+                entropy_bits = estimate_password_entropy(password)
+                password_strength = {
+                    "bits": round(entropy_bits, 2),
+                    "label": password_strength_label(entropy_bits),
+                }
+                account_created = True
+                break
+
             color_code, color_name = pick_color(username)
             session = Session(
                 conn=conn,
@@ -347,25 +601,13 @@ class ChatServer:
                 color_name=color_name,
             )
             self.add_session(session)
-            self.log(username, addr, "connect", f"room={GENERAL_ROOM} color={color_name}")
-            session.send(
-                {
-                    "type": "welcome",
-                    "timestamp": now_string(),
-                    "username": username,
-                    "room": GENERAL_ROOM,
-                    "color": color_code,
-                    "color_name": color_name,
-                    "message": "connected",
-                    "rooms": self.room_snapshot(),
-                    "help": [
-                        "/rooms",
-                        "/create <room> [password]",
-                        "/join <room> [password]",
-                        "/quit",
-                    ],
-                }
+            self.log(
+                username,
+                addr,
+                "connect",
+                f"room={GENERAL_ROOM} color={color_name} auth={'created' if account_created else 'login'}",
             )
+            session.send(self.welcome_payload(session, account_created, password_strength))
             self.broadcast(
                 GENERAL_ROOM,
                 {
@@ -378,6 +620,8 @@ class ChatServer:
             )
             return session
         finally:
+            if username is not None:
+                self.release_username(username)
             rfile.close()
 
     def client_loop(self, session: Session) -> None:

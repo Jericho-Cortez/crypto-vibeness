@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from getpass import getpass
 import json
 import socket
 import sys
@@ -52,6 +53,23 @@ def prompt_username() -> str:
         print("Username cannot be empty.")
 
 
+def prompt_new_password() -> tuple[str, str]:
+    while True:
+        password = getpass("Choose password: ")
+        confirmation = getpass("Confirm password: ")
+        if password == confirmation:
+            return password, confirmation
+        print("Passwords do not match.")
+
+
+def print_policy(policy: list[str]) -> None:
+    if not policy:
+        return
+    print("Password policy:")
+    for rule in policy:
+        print(f"  - {rule}")
+
+
 def connect(host: str, port: int) -> tuple[socket.socket, dict]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((host, port))
@@ -68,8 +86,42 @@ def connect(host: str, port: int) -> tuple[socket.socket, dict]:
         rfile.close()
         sock.close()
         raise ValueError(str(response.get("message", "login refused")))
-    rfile.close()
-    return sock, response
+    if response.get("type") != "auth_required":
+        rfile.close()
+        sock.close()
+        raise ValueError("unexpected authentication response")
+
+    mode = response.get("mode")
+    if mode == "register":
+        print("No account found. Creating a new one.")
+        print_policy(response.get("policy", []))
+    elif mode != "login":
+        rfile.close()
+        sock.close()
+        raise ValueError("unsupported authentication mode")
+
+    while True:
+        if mode == "register":
+            password, confirmation = prompt_new_password()
+            sock.sendall(json_line({"type": "auth", "password": password, "confirm": confirmation}))
+        else:
+            password = getpass("Password: ")
+            sock.sendall(json_line({"type": "auth", "password": password}))
+        raw = rfile.readline()
+        if not raw:
+            rfile.close()
+            sock.close()
+            raise ConnectionError("server closed the connection")
+        response = json.loads(raw)
+        if response.get("type") == "auth_error":
+            print(f"Error: {response.get('message', 'authentication failed')}")
+            continue
+        if response.get("type") == "welcome":
+            rfile.close()
+            return sock, response
+        rfile.close()
+        sock.close()
+        raise ValueError("unexpected authentication reply")
 
 
 def main() -> None:
@@ -101,6 +153,12 @@ def main() -> None:
             color = payload.get("color", "")
             if color:
                 safe_print(f"Your color: {color}{payload.get('color_name', '')}{ANSI_RESET}")
+            if payload.get("account_created"):
+                strength = payload.get("password_strength", {})
+                if strength:
+                    safe_print(
+                        f"Password strength: {strength.get('bits', '?')} bits ({strength.get('label', '')})"
+                    )
             print_room_list(payload.get("rooms", []))
             safe_print("Commands: /rooms, /create <room> [password], /join <room> [password], /quit")
         elif msg_type == "room_list":

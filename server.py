@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import socket
 import threading
 from dataclasses import dataclass, field
@@ -64,9 +65,46 @@ def pick_color(username: str) -> tuple[str, str]:
     return ANSI_COLORS[index]
 
 
-def hash_password(password: str) -> str:
-    digest = hashlib.md5(password.encode("utf-8")).digest()
-    return base64.b64encode(digest).decode("ascii")
+def hash_password(password: str, salt: Optional[bytes] = None) -> str:
+    """Hash password using PBKDF2-HMAC-SHA256 with per-user salt.
+    
+    Format: pbkdf2:iterations:salt:digest (all base64 except algo and iterations)
+    """
+    if salt is None:
+        salt = os.urandom(16)
+    
+    iterations = 100_000
+    key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, iterations, dklen=32)
+    
+    salt_b64 = base64.b64encode(salt).decode('ascii')
+    key_b64 = base64.b64encode(key).decode('ascii')
+    
+    return f"pbkdf2:{iterations}:{salt_b64}:{key_b64}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify password against stored PBKDF2 hash.
+    
+    Handles both new PBKDF2 format and legacy MD5 format for backwards compatibility.
+    """
+    if stored_hash.startswith('pbkdf2:'):
+        parts = stored_hash.split(':')
+        if len(parts) != 4:
+            return False
+        algo, iterations_str, salt_b64, key_b64 = parts
+        try:
+            iterations = int(iterations_str)
+            salt = base64.b64decode(salt_b64)
+            stored_key = base64.b64decode(key_b64)
+        except (ValueError, TypeError):
+            return False
+        
+        candidate_key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, iterations, dklen=32)
+        return hmac.compare_digest(stored_key, candidate_key)
+    else:
+        digest = hashlib.md5(password.encode("utf-8")).digest()
+        candidate_hash = base64.b64encode(digest).decode("ascii")
+        return hmac.compare_digest(stored_hash, candidate_hash)
 
 
 DUMMY_PASSWORD_HASH = hash_password("")
@@ -199,10 +237,10 @@ class CredentialStore:
 
     def authenticate(self, username: str, password: str) -> bool:
         stored_hash = self.get_hash(username)
-        candidate_hash = hash_password(password)
-        reference_hash = stored_hash if stored_hash is not None else DUMMY_PASSWORD_HASH
-        matched = hmac.compare_digest(reference_hash, candidate_hash)
-        return stored_hash is not None and matched
+        if stored_hash is None:
+            verify_password(password, DUMMY_PASSWORD_HASH)
+            return False
+        return verify_password(password, stored_hash)
 
 
 @dataclass

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from getpass import getpass
+import hashlib
 import json
+import os
+from pathlib import Path
 import socket
 import sys
 import threading
@@ -13,12 +17,118 @@ from typing import Optional, Tuple
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
 ANSI_RESET = "\033[0m"
+MESSAGE_KEY_ITERATIONS = 200_000
+MESSAGE_KEY_SIZE = 16
+KEY_DIR = Path("users")
 
 
 def json_line(payload: dict) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
+
+
+def derive_message_key(secret: str, salt: bytes, iterations: int = MESSAGE_KEY_ITERATIONS) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iterations, dklen=MESSAGE_KEY_SIZE)
+
+
+def tea_encrypt_block(block: bytes, key: bytes) -> bytes:
+    v0 = int.from_bytes(block[:4], "big")
+    v1 = int.from_bytes(block[4:], "big")
+    k0 = int.from_bytes(key[0:4], "big")
+    k1 = int.from_bytes(key[4:8], "big")
+    k2 = int.from_bytes(key[8:12], "big")
+    k3 = int.from_bytes(key[12:16], "big")
+    delta = 0x9E3779B9
+    total = 0
+    for _ in range(32):
+        total = (total + delta) & 0xFFFFFFFF
+        v0 = (v0 + (((v1 << 4) + k0) ^ (v1 + total) ^ ((v1 >> 5) + k1))) & 0xFFFFFFFF
+        v1 = (v1 + (((v0 << 4) + k2) ^ (v0 + total) ^ ((v0 >> 5) + k3))) & 0xFFFFFFFF
+    return v0.to_bytes(4, "big") + v1.to_bytes(4, "big")
+
+
+def tea_decrypt_block(block: bytes, key: bytes) -> bytes:
+    v0 = int.from_bytes(block[:4], "big")
+    v1 = int.from_bytes(block[4:], "big")
+    k0 = int.from_bytes(key[0:4], "big")
+    k1 = int.from_bytes(key[4:8], "big")
+    k2 = int.from_bytes(key[8:12], "big")
+    k3 = int.from_bytes(key[12:16], "big")
+    delta = 0x9E3779B9
+    total = (delta * 32) & 0xFFFFFFFF
+    for _ in range(32):
+        v1 = (v1 - (((v0 << 4) + k2) ^ (v0 + total) ^ ((v0 >> 5) + k3))) & 0xFFFFFFFF
+        v0 = (v0 - (((v1 << 4) + k0) ^ (v1 + total) ^ ((v1 >> 5) + k1))) & 0xFFFFFFFF
+        total = (total - delta) & 0xFFFFFFFF
+    return v0.to_bytes(4, "big") + v1.to_bytes(4, "big")
+
+
+def xor_bytes(left: bytes, right: bytes) -> bytes:
+    return bytes(a ^ b for a, b in zip(left, right))
+
+
+def encrypt_text(plaintext: str, key: bytes) -> str:
+    data = plaintext.encode("utf-8")
+    pad_len = 8 - (len(data) % 8)
+    padded = data + bytes([pad_len] * pad_len)
+    iv = os.urandom(8)
+    previous = iv
+    encrypted_blocks: list[bytes] = []
+    for offset in range(0, len(padded), 8):
+        block = padded[offset : offset + 8]
+        mixed = xor_bytes(block, previous)
+        encrypted = tea_encrypt_block(mixed, key)
+        encrypted_blocks.append(encrypted)
+        previous = encrypted
+    return base64.b64encode(iv + b"".join(encrypted_blocks)).decode("ascii")
+
+
+def decrypt_text(ciphertext_b64: str, key: bytes) -> str:
+    try:
+        raw = base64.b64decode(ciphertext_b64, validate=True)
+    except (base64.binascii.Error, ValueError) as exc:
+        raise ValueError("invalid encrypted payload") from exc
+    if len(raw) < 16 or len(raw) % 8 != 0:
+        raise ValueError("invalid encrypted payload length")
+    iv = raw[:8]
+    ciphertext = raw[8:]
+    previous = iv
+    decrypted_blocks: list[bytes] = []
+    for offset in range(0, len(ciphertext), 8):
+        block = ciphertext[offset : offset + 8]
+        decrypted = tea_decrypt_block(block, key)
+        plain_block = xor_bytes(decrypted, previous)
+        decrypted_blocks.append(plain_block)
+        previous = block
+    padded = b"".join(decrypted_blocks)
+    pad_len = padded[-1]
+    if pad_len < 1 or pad_len > 8 or padded[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise ValueError("invalid padding")
+    return padded[:-pad_len].decode("utf-8")
+
+
+def prompt_encryption_secret(is_register: bool) -> str:
+    while True:
+        secret = getpass("Encryption secret: ")
+        if is_register:
+            confirmation = getpass("Confirm encryption secret: ")
+            if secret != confirmation:
+                print("Encryption secrets do not match.")
+                continue
+        if not secret:
+            print("Encryption secret cannot be empty.")
+            continue
+        return secret
+
+
+def save_local_key(username: str, iterations: int, salt: bytes, key: bytes) -> None:
+    user_dir = KEY_DIR / username
+    user_dir.mkdir(parents=True, exist_ok=True)
+    salt_b64 = base64.b64encode(salt).decode("ascii")
+    key_b64 = base64.b64encode(key).decode("ascii")
+    content = f"pbkdf2:{iterations}:{salt_b64}:{key_b64}\n"
+    (user_dir / "key.txt").write_text(content, encoding="utf-8")
 
 
 def print_room_list(rooms: list[dict]) -> None:
@@ -70,7 +180,7 @@ def print_policy(policy: list[str]) -> None:
         print(f"  - {rule}")
 
 
-def connect(host: str, port: int) -> tuple[socket.socket, dict]:
+def connect(host: str, port: int) -> tuple[socket.socket, dict, bytes]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((host, port))
     rfile = sock.makefile("r", encoding="utf-8", newline="\n")
@@ -116,19 +226,55 @@ def connect(host: str, port: int) -> tuple[socket.socket, dict]:
         if response.get("type") == "auth_error":
             print(f"Error: {response.get('message', 'authentication failed')}")
             continue
-        if response.get("type") == "welcome":
-            rfile.close()
-            return sock, response
+        if response.get("type") == "key_required":
+            break
         rfile.close()
         sock.close()
         raise ValueError("unexpected authentication reply")
+
+    iterations = int(response.get("iterations", MESSAGE_KEY_ITERATIONS))
+    try:
+        salt_b64 = str(response.get("salt", ""))
+        salt = base64.b64decode(salt_b64, validate=True)
+    except (TypeError, ValueError, base64.binascii.Error):
+        rfile.close()
+        sock.close()
+        raise ValueError("invalid key exchange parameters")
+    key_mode = str(response.get("mode", mode))
+    while True:
+        secret = prompt_encryption_secret(key_mode == "register")
+        message_key = derive_message_key(secret, salt, iterations)
+        sock.sendall(
+            json_line(
+                {
+                    "type": "key_auth",
+                    "key": base64.b64encode(message_key).decode("ascii"),
+                }
+            )
+        )
+        raw = rfile.readline()
+        if not raw:
+            rfile.close()
+            sock.close()
+            raise ConnectionError("server closed the connection")
+        response = json.loads(raw)
+        if response.get("type") == "key_error":
+            print(f"Error: {response.get('message', 'invalid encryption secret')}")
+            continue
+        if response.get("type") == "welcome":
+            save_local_key(username, iterations, salt, message_key)
+            rfile.close()
+            return sock, response, message_key
+        rfile.close()
+        sock.close()
+        raise ValueError("unexpected encryption key reply")
 
 
 def main() -> None:
     host, port = parse_args()
     while True:
         try:
-            sock, welcome = connect(host, port)
+            sock, welcome, message_key = connect(host, port)
             break
         except ValueError as exc:
             print(exc)
@@ -167,7 +313,14 @@ def main() -> None:
             color = payload.get("color", "")
             username = payload.get("username", "")
             room = payload.get("room", "")
-            text = payload.get("text", "")
+            ciphertext = str(payload.get("ciphertext", ""))
+            if not ciphertext:
+                text = str(payload.get("text", ""))
+            else:
+                try:
+                    text = decrypt_text(ciphertext, message_key)
+                except ValueError:
+                    text = "<unable to decrypt message>"
             safe_print(f"[{timestamp}] [{room}] {color}{username}{ANSI_RESET}: {text}")
         elif msg_type == "system":
             room = payload.get("room", "")
@@ -233,7 +386,7 @@ def main() -> None:
                     continue
                 print("Commands: /rooms, /create <room> [password], /join <room> [password], /quit")
             else:
-                sock.sendall(json_line({"type": "message", "text": line}))
+                sock.sendall(json_line({"type": "message", "ciphertext": encrypt_text(line, message_key)}))
     except (BrokenPipeError, OSError):
         pass
     finally:

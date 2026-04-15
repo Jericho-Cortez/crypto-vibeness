@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Set
 
 PASSWORD_STORE_PATH = Path("this_is_safe.txt")
 PASSWORD_RULES_PATH = Path("password_rules.json")
+KEY_STORE_PATH = Path("user_keys_do_not_steal_plz.txt")
 DEFAULT_PASSWORD_RULES = {
     "min_length": 12,
     "min_lowercase": 1,
@@ -31,6 +32,8 @@ DEFAULT_PORT = 5050
 HOST = "0.0.0.0"
 LOG_PREFIX = "log_"
 GENERAL_ROOM = "general"
+MESSAGE_KEY_ITERATIONS = 200_000
+MESSAGE_KEY_SIZE = 16
 
 ANSI_RESET = "\033[0m"
 ANSI_COLORS = [
@@ -105,6 +108,82 @@ def verify_password(password: str, stored_hash: str) -> bool:
         digest = hashlib.md5(password.encode("utf-8")).digest()
         candidate_hash = base64.b64encode(digest).decode("ascii")
         return hmac.compare_digest(stored_hash, candidate_hash)
+
+
+def tea_encrypt_block(block: bytes, key: bytes) -> bytes:
+    v0 = int.from_bytes(block[:4], "big")
+    v1 = int.from_bytes(block[4:], "big")
+    k0 = int.from_bytes(key[0:4], "big")
+    k1 = int.from_bytes(key[4:8], "big")
+    k2 = int.from_bytes(key[8:12], "big")
+    k3 = int.from_bytes(key[12:16], "big")
+    delta = 0x9E3779B9
+    total = 0
+    for _ in range(32):
+        total = (total + delta) & 0xFFFFFFFF
+        v0 = (v0 + (((v1 << 4) + k0) ^ (v1 + total) ^ ((v1 >> 5) + k1))) & 0xFFFFFFFF
+        v1 = (v1 + (((v0 << 4) + k2) ^ (v0 + total) ^ ((v0 >> 5) + k3))) & 0xFFFFFFFF
+    return v0.to_bytes(4, "big") + v1.to_bytes(4, "big")
+
+
+def tea_decrypt_block(block: bytes, key: bytes) -> bytes:
+    v0 = int.from_bytes(block[:4], "big")
+    v1 = int.from_bytes(block[4:], "big")
+    k0 = int.from_bytes(key[0:4], "big")
+    k1 = int.from_bytes(key[4:8], "big")
+    k2 = int.from_bytes(key[8:12], "big")
+    k3 = int.from_bytes(key[12:16], "big")
+    delta = 0x9E3779B9
+    total = (delta * 32) & 0xFFFFFFFF
+    for _ in range(32):
+        v1 = (v1 - (((v0 << 4) + k2) ^ (v0 + total) ^ ((v0 >> 5) + k3))) & 0xFFFFFFFF
+        v0 = (v0 - (((v1 << 4) + k0) ^ (v1 + total) ^ ((v1 >> 5) + k1))) & 0xFFFFFFFF
+        total = (total - delta) & 0xFFFFFFFF
+    return v0.to_bytes(4, "big") + v1.to_bytes(4, "big")
+
+
+def xor_bytes(left: bytes, right: bytes) -> bytes:
+    return bytes(a ^ b for a, b in zip(left, right))
+
+
+def encrypt_text(plaintext: str, key: bytes) -> str:
+    data = plaintext.encode("utf-8")
+    pad_len = 8 - (len(data) % 8)
+    padded = data + bytes([pad_len] * pad_len)
+    iv = os.urandom(8)
+    previous = iv
+    encrypted_blocks: List[bytes] = []
+    for offset in range(0, len(padded), 8):
+        block = padded[offset : offset + 8]
+        mixed = xor_bytes(block, previous)
+        encrypted = tea_encrypt_block(mixed, key)
+        encrypted_blocks.append(encrypted)
+        previous = encrypted
+    return base64.b64encode(iv + b"".join(encrypted_blocks)).decode("ascii")
+
+
+def decrypt_text(ciphertext_b64: str, key: bytes) -> str:
+    try:
+        raw = base64.b64decode(ciphertext_b64, validate=True)
+    except (base64.binascii.Error, ValueError) as exc:
+        raise ValueError("invalid encrypted payload") from exc
+    if len(raw) < 16 or len(raw) % 8 != 0:
+        raise ValueError("invalid encrypted payload length")
+    iv = raw[:8]
+    ciphertext = raw[8:]
+    previous = iv
+    decrypted_blocks: List[bytes] = []
+    for offset in range(0, len(ciphertext), 8):
+        block = ciphertext[offset : offset + 8]
+        decrypted = tea_decrypt_block(block, key)
+        plain_block = xor_bytes(decrypted, previous)
+        decrypted_blocks.append(plain_block)
+        previous = block
+    padded = b"".join(decrypted_blocks)
+    pad_len = padded[-1]
+    if pad_len < 1 or pad_len > 8 or padded[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise ValueError("invalid padding")
+    return padded[:-pad_len].decode("utf-8")
 
 
 DUMMY_PASSWORD_HASH = hash_password("")
@@ -244,6 +323,64 @@ class CredentialStore:
 
 
 @dataclass
+class MessageKeyRecord:
+    iterations: int
+    salt: bytes
+    key: bytes
+
+
+@dataclass
+class MessageKeyStore:
+    path: Path
+    users: Dict[str, MessageKeyRecord] = field(default_factory=dict)
+
+    @classmethod
+    def load(cls, path: Path) -> "MessageKeyStore":
+        if not path.exists():
+            path.write_text("", encoding="utf-8")
+        users: Dict[str, MessageKeyRecord] = {}
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            parts = line.split(":")
+            if len(parts) != 5:
+                raise ValueError(f"invalid key line {line_number}: expected 5 fields")
+            username, algo, iterations_str, salt_b64, key_b64 = parts
+            if algo != "pbkdf2":
+                raise ValueError(f"invalid key line {line_number}: unsupported algorithm '{algo}'")
+            try:
+                iterations = int(iterations_str)
+                salt = base64.b64decode(salt_b64, validate=True)
+                key = base64.b64decode(key_b64, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise ValueError(f"invalid key line {line_number}: malformed base64 or iterations") from exc
+            if not username or len(salt) < 12 or len(key) < MESSAGE_KEY_SIZE:
+                raise ValueError(f"invalid key line {line_number}: empty username or weak key data")
+            users[username] = MessageKeyRecord(iterations=iterations, salt=salt, key=key[:MESSAGE_KEY_SIZE])
+        return cls(path=path, users=users)
+
+    def save(self) -> None:
+        lines: List[str] = []
+        for username, record in sorted(self.users.items()):
+            salt_b64 = base64.b64encode(record.salt).decode("ascii")
+            key_b64 = base64.b64encode(record.key).decode("ascii")
+            lines.append(f"{username}:pbkdf2:{record.iterations}:{salt_b64}:{key_b64}")
+        content = "\n".join(lines)
+        if content:
+            content += "\n"
+        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        temp_path.write_text(content, encoding="utf-8")
+        temp_path.replace(self.path)
+
+    def get(self, username: str) -> Optional[MessageKeyRecord]:
+        return self.users.get(username)
+
+    def set_user(self, username: str, record: MessageKeyRecord) -> None:
+        self.users[username] = record
+        self.save()
+
+
+@dataclass
 class Room:
     name: str
     password: Optional[str] = None
@@ -262,6 +399,7 @@ class Session:
     room: str
     color_code: str
     color_name: str
+    message_key: bytes
     send_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def send(self, payload: dict) -> None:
@@ -279,6 +417,7 @@ class ChatServer:
         self.pending_auth: Set[str] = set()
         self.password_rules = PasswordRules.load(PASSWORD_RULES_PATH)
         self.credentials = CredentialStore.load(PASSWORD_STORE_PATH)
+        self.message_keys = MessageKeyStore.load(KEY_STORE_PATH)
         self.log_path = log_name()
         self.log_file = open(self.log_path, "a", encoding="utf-8", buffering=1)
 
@@ -405,21 +544,46 @@ class ChatServer:
     def auth_error(self, message: str) -> dict:
         return {"type": "auth_error", "timestamp": now_string(), "message": message}
 
+    def key_prompt(self, username: str, mode: str, salt: bytes, iterations: int) -> dict:
+        return {
+            "type": "key_required",
+            "timestamp": now_string(),
+            "username": username,
+            "mode": mode,
+            "iterations": iterations,
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "algorithm": "pbkdf2-tea",
+        }
+
+    def key_error(self, message: str) -> dict:
+        return {"type": "key_error", "timestamp": now_string(), "message": message}
+
     def handle_rooms(self, session: Session) -> None:
         session.send({"type": "room_list", "timestamp": now_string(), "rooms": self.room_snapshot()})
 
-    def handle_message(self, session: Session, text: str) -> None:
-        payload = {
-            "type": "message",
-            "timestamp": now_string(),
-            "room": session.room,
-            "username": session.username,
-            "color": session.color_code,
-            "color_name": session.color_name,
-            "text": text,
-        }
-        self.broadcast(session.room, payload)
-        self.log(session.username, session.addr, "message", f"room={session.room} text={text}")
+    def handle_message(self, session: Session, ciphertext: str) -> None:
+        text = decrypt_text(ciphertext, session.message_key)
+        timestamp = now_string()
+        with self.lock:
+            room = self.rooms.get(session.room)
+            if room is None:
+                return
+            recipients = [self.sessions[name] for name in room.members if name in self.sessions]
+        for recipient in recipients:
+            payload = {
+                "type": "message",
+                "timestamp": timestamp,
+                "room": session.room,
+                "username": session.username,
+                "color": session.color_code,
+                "color_name": session.color_name,
+                "ciphertext": encrypt_text(text, recipient.message_key),
+            }
+            try:
+                recipient.send(payload)
+            except OSError:
+                self.disconnect(recipient.username, "send failure")
+        self.log(session.username, session.addr, "message", f"room={session.room} ciphertext={ciphertext}")
 
     def handle_create(self, session: Session, room_name: str, password: Optional[str]) -> None:
         previous_room = self.create_and_join_room(session, room_name, password)
@@ -629,6 +793,64 @@ class ChatServer:
                 account_created = True
                 break
 
+            with self.lock:
+                key_record = self.message_keys.get(username)
+            key_mode = mode
+            if mode == "login" and key_record is None:
+                key_mode = "register"
+            if key_mode == "login":
+                if key_record is None:
+                    self.send_payload(conn, self.key_error("encryption key not initialized"))
+                    return None
+                key_salt = key_record.salt
+                key_iterations = key_record.iterations
+            else:
+                key_salt = os.urandom(16)
+                key_iterations = MESSAGE_KEY_ITERATIONS
+            self.send_payload(conn, self.key_prompt(username, key_mode, key_salt, key_iterations))
+            session_key: Optional[bytes] = None
+            while True:
+                raw = rfile.readline()
+                if not raw:
+                    return None
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    self.send_payload(conn, self.key_error("invalid key payload"))
+                    continue
+                if payload.get("type") != "key_auth":
+                    self.send_payload(conn, self.key_error("expected key_auth payload"))
+                    continue
+                key_b64 = str(payload.get("key", ""))
+                try:
+                    provided_key = base64.b64decode(key_b64, validate=True)
+                except (ValueError, base64.binascii.Error):
+                    self.send_payload(conn, self.key_error("invalid key format"))
+                    continue
+                if len(provided_key) < MESSAGE_KEY_SIZE:
+                    self.send_payload(conn, self.key_error("encryption key too short"))
+                    continue
+                provided_key = provided_key[:MESSAGE_KEY_SIZE]
+                if key_mode == "login":
+                    if key_record is None:
+                        self.send_payload(conn, self.key_error("encryption key not initialized"))
+                        continue
+                    if hmac.compare_digest(key_record.key, provided_key):
+                        session_key = provided_key
+                        break
+                    self.send_payload(conn, self.key_error("incorrect encryption secret"))
+                    continue
+                with self.lock:
+                    self.message_keys.set_user(
+                        username,
+                        MessageKeyRecord(iterations=key_iterations, salt=key_salt, key=provided_key),
+                    )
+                session_key = provided_key
+                break
+
+            if session_key is None:
+                return None
+
             color_code, color_name = pick_color(username)
             session = Session(
                 conn=conn,
@@ -637,6 +859,7 @@ class ChatServer:
                 room=GENERAL_ROOM,
                 color_code=color_code,
                 color_name=color_name,
+                message_key=session_key,
             )
             self.add_session(session)
             self.log(
@@ -677,9 +900,14 @@ class ChatServer:
                     continue
                 msg_type = payload.get("type")
                 if msg_type == "message":
-                    text = str(payload.get("text", "")).rstrip()
-                    if text:
-                        self.handle_message(session, text)
+                    ciphertext = str(payload.get("ciphertext", "")).strip()
+                    if not ciphertext:
+                        session.send({"type": "error", "timestamp": now_string(), "message": "ciphertext required"})
+                        continue
+                    try:
+                        self.handle_message(session, ciphertext)
+                    except ValueError:
+                        session.send({"type": "error", "timestamp": now_string(), "message": "invalid encrypted message"})
                 elif msg_type == "command":
                     command = str(payload.get("command", "")).strip().lower()
                     room_name = str(payload.get("room", "")).strip()

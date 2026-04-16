@@ -2,7 +2,7 @@
 
 ## Project: Secure Chat System (Python)
 
-**Status:** Day 1 complete (multi-user chat, rooms, colors, logs, password-protected rooms).
+**Status:** Jour 3 complete (asymmetric key exchange, RSA-2048, key encapsulation).
 **Files:** server.py, client.py, README.md, log_*.txt, password_rules.json, this_is_safe.txt.
 
 ---
@@ -78,6 +78,6 @@ No frameworks (Flask, etc.).
 ---
 
 ## Next action
-Continue from **Jour 2**.
+Continue from **Jour 3.5**.
 Run tests after implementing each bullet point.
 At the end of each day’s work, output the exact line "Jour X - terminé".

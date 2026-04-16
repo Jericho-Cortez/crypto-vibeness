@@ -1,0 +1,2 @@
+[2026-04-16 11:05:01] [127.0.0.1:51590] [testjourthree] connect - room=general color=green auth=created
+[2026-04-16 11:05:01] [127.0.0.1:51590] [testjourthree] disconnect - client closed connection

@@ -15,6 +15,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.backends import default_backend
 
 PASSWORD_STORE_PATH = Path("this_is_safe.txt")
 PASSWORD_RULES_PATH = Path("password_rules.json")
@@ -34,6 +37,7 @@ LOG_PREFIX = "log_"
 GENERAL_ROOM = "general"
 MESSAGE_KEY_ITERATIONS = 200_000
 MESSAGE_KEY_SIZE = 16
+RSA_KEY_SIZE = 2048
 
 ANSI_RESET = "\033[0m"
 ANSI_COLORS = [
@@ -418,6 +422,12 @@ class ChatServer:
         self.password_rules = PasswordRules.load(PASSWORD_RULES_PATH)
         self.credentials = CredentialStore.load(PASSWORD_STORE_PATH)
         self.message_keys = MessageKeyStore.load(KEY_STORE_PATH)
+        
+        self.server_key = rsa.generate_private_key(public_exponent=65537, key_size=RSA_KEY_SIZE, backend=default_backend())
+        pub_key = self.server_key.public_key()
+        pub_pem = pub_key.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+        self.server_pub_key_pem = pub_pem.decode("ascii")
+        
         self.log_path = log_name()
         self.log_file = open(self.log_path, "a", encoding="utf-8", buffering=1)
 
@@ -553,6 +563,7 @@ class ChatServer:
             "iterations": iterations,
             "salt": base64.b64encode(salt).decode("ascii"),
             "algorithm": "pbkdf2-tea",
+            "server_public_key": self.server_pub_key_pem,
         }
 
     def key_error(self, message: str) -> dict:
@@ -808,6 +819,28 @@ class ChatServer:
                 key_salt = os.urandom(16)
                 key_iterations = MESSAGE_KEY_ITERATIONS
             self.send_payload(conn, self.key_prompt(username, key_mode, key_salt, key_iterations))
+            
+            client_pub_key_pem: Optional[str] = None
+            while True:
+                raw = rfile.readline()
+                if not raw:
+                    return None
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    self.send_payload(conn, self.key_error("invalid payload"))
+                    continue
+                if payload.get("type") == "client_public_key":
+                    try:
+                        client_pub_key_pem = str(payload.get("public_key", ""))
+                        serialization.load_pem_public_key(client_pub_key_pem.encode(), backend=default_backend())
+                    except Exception:
+                        self.send_payload(conn, self.key_error("invalid client public key"))
+                        continue
+                    self.send_payload(conn, {"type": "encapsulate_key", "timestamp": now_string()})
+                    break
+                self.send_payload(conn, self.key_error("expected client_public_key"))
+            
             session_key: Optional[bytes] = None
             while True:
                 raw = rfile.readline()
@@ -816,21 +849,25 @@ class ChatServer:
                 try:
                     payload = json.loads(raw)
                 except json.JSONDecodeError:
-                    self.send_payload(conn, self.key_error("invalid key payload"))
+                    self.send_payload(conn, self.key_error("invalid encapsulation payload"))
                     continue
-                if payload.get("type") != "key_auth":
-                    self.send_payload(conn, self.key_error("expected key_auth payload"))
+                if payload.get("type") != "key_encapsulation":
+                    self.send_payload(conn, self.key_error("expected key_encapsulation payload"))
                     continue
-                key_b64 = str(payload.get("key", ""))
+                
                 try:
-                    provided_key = base64.b64decode(key_b64, validate=True)
-                except (ValueError, base64.binascii.Error):
-                    self.send_payload(conn, self.key_error("invalid key format"))
+                    encapsulated_b64 = str(payload.get("encapsulated_key", ""))
+                    encapsulated = base64.b64decode(encapsulated_b64, validate=True)
+                    provided_key = self.server_key.decrypt(encapsulated, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+                except Exception:
+                    self.send_payload(conn, self.key_error("failed to decapsulate key"))
                     continue
+                
                 if len(provided_key) < MESSAGE_KEY_SIZE:
                     self.send_payload(conn, self.key_error("encryption key too short"))
                     continue
                 provided_key = provided_key[:MESSAGE_KEY_SIZE]
+                
                 if key_mode == "login":
                     if key_record is None:
                         self.send_payload(conn, self.key_error("encryption key not initialized"))

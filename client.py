@@ -9,6 +9,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.backends import default_backend
 import socket
 import sys
 import threading
@@ -20,12 +23,46 @@ ANSI_RESET = "\033[0m"
 MESSAGE_KEY_ITERATIONS = 200_000
 MESSAGE_KEY_SIZE = 16
 KEY_DIR = Path("users")
+RSA_KEY_SIZE = 2048
 
 
 def json_line(payload: dict) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
+
+
+def get_or_create_rsa_keypair(username: str):
+    user_dir = KEY_DIR / username
+    user_dir.mkdir(parents=True, exist_ok=True)
+    priv_path = user_dir / "key.priv"
+    pub_path = user_dir / "key.pub"
+    
+    if priv_path.exists() and pub_path.exists():
+        priv_pem = priv_path.read_bytes()
+        pub_pem = pub_path.read_bytes()
+        priv_key = serialization.load_pem_private_key(priv_pem, password=None, backend=default_backend())
+        pub_key = serialization.load_pem_public_key(pub_pem, backend=default_backend())
+        return priv_key, pub_key
+    
+    priv_key = rsa.generate_private_key(public_exponent=65537, key_size=RSA_KEY_SIZE, backend=default_backend())
+    pub_key = priv_key.public_key()
+    priv_pem = priv_key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption())
+    pub_pem = pub_key.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+    priv_path.write_bytes(priv_pem)
+    pub_path.write_bytes(pub_pem)
+    return priv_key, pub_key
+
+
+def encapsulate_key(server_public_key_pem: str, session_key: bytes) -> str:
+    pub_key = serialization.load_pem_public_key(server_public_key_pem.encode(), backend=default_backend())
+    encrypted = pub_key.encrypt(session_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def decapsulate_key(client_private_key, encrypted_key_b64: str) -> bytes:
+    encrypted = base64.b64decode(encrypted_key_b64)
+    return client_private_key.decrypt(encrypted, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
 
 
 def derive_message_key(secret: str, salt: bytes, iterations: int = MESSAGE_KEY_ITERATIONS) -> bytes:
@@ -236,38 +273,50 @@ def connect(host: str, port: int) -> tuple[socket.socket, dict, bytes]:
     try:
         salt_b64 = str(response.get("salt", ""))
         salt = base64.b64decode(salt_b64, validate=True)
+        server_pub_key_pem = str(response.get("server_public_key", ""))
     except (TypeError, ValueError, base64.binascii.Error):
         rfile.close()
         sock.close()
         raise ValueError("invalid key exchange parameters")
-    key_mode = str(response.get("mode", mode))
-    while True:
-        secret = prompt_encryption_secret(key_mode == "register")
-        message_key = derive_message_key(secret, salt, iterations)
-        sock.sendall(
-            json_line(
-                {
-                    "type": "key_auth",
-                    "key": base64.b64encode(message_key).decode("ascii"),
-                }
-            )
-        )
-        raw = rfile.readline()
-        if not raw:
-            rfile.close()
-            sock.close()
-            raise ConnectionError("server closed the connection")
-        response = json.loads(raw)
-        if response.get("type") == "key_error":
-            print(f"Error: {response.get('message', 'invalid encryption secret')}")
-            continue
-        if response.get("type") == "welcome":
-            save_local_key(username, iterations, salt, message_key)
-            rfile.close()
-            return sock, response, message_key
+    
+    priv_key, pub_key = get_or_create_rsa_keypair(username)
+    pub_key_pem = pub_key.export_key().decode("ascii")
+    
+    sock.sendall(json_line({"type": "client_public_key", "public_key": pub_key_pem}))
+    raw = rfile.readline()
+    if not raw:
         rfile.close()
         sock.close()
-        raise ValueError("unexpected encryption key reply")
+        raise ConnectionError("server closed the connection")
+    response = json.loads(raw)
+    if response.get("type") != "encapsulate_key":
+        rfile.close()
+        sock.close()
+        raise ValueError("expected encapsulate_key from server")
+    
+    secret = prompt_encryption_secret(False)
+    message_key = derive_message_key(secret, salt, iterations)
+    encapsulated = encapsulate_key(server_pub_key_pem, message_key)
+    sock.sendall(json_line({"type": "key_encapsulation", "encapsulated_key": encapsulated}))
+    
+    raw = rfile.readline()
+    if not raw:
+        rfile.close()
+        sock.close()
+        raise ConnectionError("server closed the connection")
+    response = json.loads(raw)
+    if response.get("type") == "key_error":
+        print(f"Error: {response.get('message', 'key encapsulation failed')}")
+        rfile.close()
+        sock.close()
+        raise ValueError("key encapsulation failed")
+    if response.get("type") == "welcome":
+        save_local_key(username, iterations, salt, message_key)
+        rfile.close()
+        return sock, response, message_key
+    rfile.close()
+    sock.close()
+    raise ValueError("unexpected key encapsulation reply")
 
 
 def main() -> None:

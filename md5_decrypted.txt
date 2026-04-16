@@ -1,19 +1,12 @@
-MD5 Hash Cracking Attempt - 2026-04-15
-======================================
+Mot de passe MD5 récupéré
+=========================
 
-Hash: 35b95f7c0f63631c453220fb2a86f218
-Mask: ?u?u?l?l?u?u?s (7 characters)
+Hash : 35b95f7c0f63631c453220fb2a86f218
 
-Search Space: ~9.88 billion combinations (26^4 * 32 * 26^2)
+Commande utilisée :
+hashcat --show -m 0 md5_yolo.txt
 
-Approach:
-- Attempted brute force with Python using itertools.product()
-- Tested educated guesses based on common security terms
-- Progressed to ~250 million combinations before timeout
+Résultat :
+35b95f7c0f63631c453220fb2a86f218:CMrsBB!
 
-Status: Incomplete - computational cost exceeds practical testing timeframe
-
-Note for Jour 2.5: Use hashcat with GPU acceleration for production password cracking.
-Recommend: Docker container with hashcat or dedicated GPU machine.
-
-For this exercise, proceeding to implement Argon2/bcrypt KDF replacement (higher priority).
+Statut : cassé

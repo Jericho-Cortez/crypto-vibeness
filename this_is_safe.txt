@@ -1,0 +1,4 @@
+Badis:pbkdf2:100000:mRd43drBD9PRXhI1/2zwvA==:PdKvBC3M3j+WTAVWY1jkzC5h1FoLdGWxeekwHnXeV3o=
+Jericho:pbkdf2:100000:1dHNVcq0AJVjLz2ROdBfFA==:6z3IwbL8zLmc1olxwrobyu5eJDhMXFPCf8o8c2ym4s0=
+Rachel:pbkdf2:100000:yIy1blbdVHh/s3vFp2OqKw==:AiVXkCFgeBfiHyIrsKpg9/nJoi3t0eADFbJiSH6hoSc=
+jericho:pbkdf2:100000:TXAZ+EF3RtOr1MSjXeAOvQ==:arpPmJr3K0wSB3JsnXrvm8wjyJCR6yjORSk6rMtGJbc=

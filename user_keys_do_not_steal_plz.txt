@@ -1,1 +1,6 @@
+Jericho:pbkdf2:200000:Rggwt35vORWcXuQIIT4VmQ==:U5Yxwi3IwhTIjhrCerUjRA==
+alice_j3:pbkdf2:200000:BZvGsEjgYTxeHwws7F375A==:QfKqY+jDZ02lMmlWgZmEmQ==
+badis:pbkdf2:200000:RkniwB1SCclDcWhrCVnPyg==:fy8J6XwjvQpKyaqmei64PQ==
+bob_j3:pbkdf2:200000:yA4FCcCM3dF9V4A+td4dFQ==:FqoXMy9E9+sVojxMmP3JIw==
 testjourthree:pbkdf2:200000:fFV8FjcqvtiUHMueKNExyg==:1oPwpoBqSBNkl+o3JISY3A==
+was:pbkdf2:200000:yKwLgRxxT1gRF56COQIDEw==:aQlY5M9NWGMK0xD0QqS9AA==

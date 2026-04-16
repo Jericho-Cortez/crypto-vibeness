@@ -1,5 +1,10 @@
+Jericho:pbkdf2:100000:DARN/T+pUDc7NTUHMQ931w==:8VzGzK83p8IV+6jgrPtWSrfYw6s5aKlZ3V1EGFsLqs4=
+alice_j3:pbkdf2:100000:txpUmKGlhCOGB6CSlQx/bg==:3J5f1tQk5annuGoy/SP9veXoGuoxbFRtouKnYmfuGHE=
+badis:pbkdf2:100000:h/K55mgy6U0FwaMUQi6DVg==:9WPChX+N292bKCh4zlIdstG9924t3+leNWIiDGzznc4=
+bob_j3:pbkdf2:100000:lQux50J1nsnpq3P0b7psKA==:5kVOTJVux3da+rFmNRIDO6zDuf778ahaqnGJz1fqbYg=
 jour3_final_test:pbkdf2:100000:HSk7HTMmXhv/kf/X3v9rjg==:q8UcKqK/2KWe9AsX1L9gMVXMBas6KF6QtEKg4y5v6p0=
 test123:pbkdf2:100000:e7yakhT8G8V6CZuAKtzg4g==:sNDcayL1w1AJcxsprU7QrtF0VOrNtUMqI4KxzQe6pKM=
 testjourthree:pbkdf2:100000:O5Rk4InryP5azwKm4eC41Q==:CXgwIPtqU2QHN7fumV4wEARoJC6gjzD3VIB4yfwr1sA=
 testuser99:pbkdf2:100000:rfOHy8MF+ufYPeRVcgvf7w==:nLu9TOtks8QqxfMSbMEgVBUNtK7IkCwH5NjGpEm5Qhw=
 user1_test:pbkdf2:100000:VKBoa21FKiME7oyXyPoKSQ==:Ek9Ut3K+5k96CqkvewigTeCu2s3QZ1dyICvobQEvRBc=
+was:pbkdf2:100000:vUiLuqzYMuFqH5fk/uIEXw==:RB07q9zEn0lVnc3DwS3yEdjwNzO8/7s2VyblgSTY2yc=

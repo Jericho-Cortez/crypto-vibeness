@@ -14,7 +14,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 PASSWORD_STORE_PATH = Path("this_is_safe.txt")
 PASSWORD_RULES_PATH = Path("password_rules.json")
@@ -184,6 +184,21 @@ def decrypt_text(ciphertext_b64: str, key: bytes) -> str:
     if pad_len < 1 or pad_len > 8 or padded[-pad_len:] != bytes([pad_len]) * pad_len:
         raise ValueError("invalid padding")
     return padded[:-pad_len].decode("utf-8")
+
+
+def normalize_public_key(payload: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(payload, dict):
+        return None
+    n_raw = payload.get("n")
+    e_raw = payload.get("e")
+    try:
+        n = int(str(n_raw))
+        e = int(str(e_raw))
+    except (TypeError, ValueError):
+        return None
+    if n <= 0 or e <= 1:
+        return None
+    return {"n": str(n), "e": str(e)}
 
 
 DUMMY_PASSWORD_HASH = hash_password("")
@@ -400,6 +415,7 @@ class Session:
     color_code: str
     color_name: str
     message_key: bytes
+    public_key: Dict[str, str]
     send_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def send(self, payload: dict) -> None:
@@ -585,6 +601,59 @@ class ChatServer:
                 self.disconnect(recipient.username, "send failure")
         self.log(session.username, session.addr, "message", f"room={session.room} ciphertext={ciphertext}")
 
+    def handle_peer_key_request(self, session: Session, peer_username: str) -> None:
+        with self.lock:
+            peer_session = self.sessions.get(peer_username)
+        if peer_session is None:
+            session.send({"type": "error", "timestamp": now_string(), "message": f"user '{peer_username}' is not online"})
+            return
+        session.send(
+            {
+                "type": "peer_key",
+                "timestamp": now_string(),
+                "username": peer_username,
+                "public_key": peer_session.public_key,
+            }
+        )
+
+    def handle_pair_key(self, session: Session, peer_username: str, encrypted_key: str, signature: str) -> None:
+        with self.lock:
+            peer_session = self.sessions.get(peer_username)
+        if peer_session is None:
+            session.send({"type": "error", "timestamp": now_string(), "message": f"user '{peer_username}' is not online"})
+            return
+        peer_session.send(
+            {
+                "type": "pair_key",
+                "timestamp": now_string(),
+                "from": session.username,
+                "to": peer_username,
+                "encrypted_key": encrypted_key,
+                "signature": signature,
+                "public_key": session.public_key,
+            }
+        )
+        self.log(session.username, session.addr, "pair_key", f"to={peer_username} encrypted_key={encrypted_key}")
+
+    def handle_direct_message(self, session: Session, peer_username: str, ciphertext: str, signature: str) -> None:
+        with self.lock:
+            peer_session = self.sessions.get(peer_username)
+        if peer_session is None:
+            session.send({"type": "error", "timestamp": now_string(), "message": f"user '{peer_username}' is not online"})
+            return
+        peer_session.send(
+            {
+                "type": "direct_message",
+                "timestamp": now_string(),
+                "from": session.username,
+                "to": peer_username,
+                "ciphertext": ciphertext,
+                "signature": signature,
+                "public_key": session.public_key,
+            }
+        )
+        self.log(session.username, session.addr, "direct_message", f"to={peer_username} ciphertext={ciphertext}")
+
     def handle_create(self, session: Session, room_name: str, password: Optional[str]) -> None:
         previous_room = self.create_and_join_room(session, room_name, password)
         self.log(
@@ -687,6 +756,7 @@ class ChatServer:
                 "/rooms",
                 "/create <room> [password]",
                 "/join <room> [password]",
+                "/dm <username> <message>",
                 "/quit",
             ],
             "account_created": account_created,
@@ -733,6 +803,13 @@ class ChatServer:
             username = str(payload.get("username", "")).strip()
             if not username:
                 self.send_payload(conn, {"type": "error", "timestamp": now_string(), "message": "username required"})
+                return None
+            client_public_key = normalize_public_key(payload.get("public_key"))
+            if client_public_key is None:
+                self.send_payload(
+                    conn,
+                    {"type": "error", "timestamp": now_string(), "message": "valid public_key required"},
+                )
                 return None
             if not self.reserve_username(username):
                 self.send_payload(
@@ -860,6 +937,7 @@ class ChatServer:
                 color_code=color_code,
                 color_name=color_name,
                 message_key=session_key,
+                public_key=client_public_key,
             )
             self.add_session(session)
             self.log(
@@ -908,13 +986,53 @@ class ChatServer:
                         self.handle_message(session, ciphertext)
                     except ValueError:
                         session.send({"type": "error", "timestamp": now_string(), "message": "invalid encrypted message"})
+                elif msg_type == "pair_key":
+                    peer_username = str(payload.get("to", "")).strip()
+                    encrypted_key = str(payload.get("encrypted_key", "")).strip()
+                    signature = str(payload.get("signature", "")).strip()
+                    if not peer_username or not encrypted_key or not signature:
+                        session.send(
+                            {
+                                "type": "error",
+                                "timestamp": now_string(),
+                                "message": "to, encrypted_key and signature are required",
+                            }
+                        )
+                        continue
+                    self.handle_pair_key(session, peer_username, encrypted_key, signature)
+                elif msg_type == "direct_message":
+                    peer_username = str(payload.get("to", "")).strip()
+                    ciphertext = str(payload.get("ciphertext", "")).strip()
+                    signature = str(payload.get("signature", "")).strip()
+                    if not peer_username or not ciphertext or not signature:
+                        session.send(
+                            {
+                                "type": "error",
+                                "timestamp": now_string(),
+                                "message": "to, ciphertext and signature are required",
+                            }
+                        )
+                        continue
+                    self.handle_direct_message(session, peer_username, ciphertext, signature)
                 elif msg_type == "command":
                     command = str(payload.get("command", "")).strip().lower()
                     room_name = str(payload.get("room", "")).strip()
+                    peer_username = str(payload.get("username", "")).strip()
                     password = payload.get("password")
                     normalized_password = None if password is None else str(password).strip() or None
                     if command == "rooms":
                         self.handle_rooms(session)
+                    elif command == "peer_key":
+                        if not peer_username:
+                            session.send(
+                                {
+                                    "type": "error",
+                                    "timestamp": now_string(),
+                                    "message": "username required",
+                                }
+                            )
+                            continue
+                        self.handle_peer_key_request(session, peer_username)
                     elif command == "create":
                         if not room_name:
                             session.send(

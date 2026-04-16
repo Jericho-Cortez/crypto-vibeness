@@ -840,6 +840,7 @@ class ChatServer:
                     self.send_payload(conn, {"type": "encapsulate_key", "timestamp": now_string()})
                     break
                 self.send_payload(conn, self.key_error("expected client_public_key"))
+                continue
             
             session_key: Optional[bytes] = None
             while True:

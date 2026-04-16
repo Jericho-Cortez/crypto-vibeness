@@ -280,7 +280,10 @@ def connect(host: str, port: int) -> tuple[socket.socket, dict, bytes]:
         raise ValueError("invalid key exchange parameters")
     
     priv_key, pub_key = get_or_create_rsa_keypair(username)
-    pub_key_pem = pub_key.export_key().decode("ascii")
+    pub_key_pem = pub_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode("ascii")
     
     sock.sendall(json_line({"type": "client_public_key", "public_key": pub_key_pem}))
     raw = rfile.readline()

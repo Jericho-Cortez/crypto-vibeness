@@ -18,6 +18,13 @@ from typing import Any, Optional
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
 ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_CYAN = "\033[36m"
+ANSI_GREEN = "\033[32m"
+ANSI_MAGENTA = "\033[35m"
+ANSI_RED = "\033[31m"
+ANSI_YELLOW = "\033[33m"
 MESSAGE_KEY_ITERATIONS = 200_000
 MESSAGE_KEY_SIZE = 16
 KEY_DIR = Path("users")
@@ -32,6 +39,19 @@ def json_line(payload: dict) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
+
+
+def styled(text: str, *, color: str = "", bold: bool = False, dim: bool = False) -> str:
+    prefix = ""
+    if bold:
+        prefix += ANSI_BOLD
+    if dim:
+        prefix += ANSI_DIM
+    if color:
+        prefix += color
+    if not prefix:
+        return text
+    return f"{prefix}{text}{ANSI_RESET}"
 
 
 def derive_message_key(secret: str, salt: bytes, iterations: int = MESSAGE_KEY_ITERATIONS) -> bytes:
@@ -330,10 +350,14 @@ def save_local_key(username: str, iterations: int, salt: bytes, key: bytes) -> N
 
 
 def print_room_list(rooms: list[dict]) -> None:
-    print("Rooms:")
+    print(styled("🏠 Rooms:", bold=True, color=ANSI_CYAN))
     for room in rooms:
-        marker = " [locked]" if room.get("protected") else ""
-        print(f"  - {room.get('name')} {marker} ({room.get('members')} users)")
+        marker = "🔒" if room.get("protected") else "🔓"
+        color = ANSI_RED if room.get("protected") else ANSI_GREEN
+        print(
+            f"  - {styled(marker, color=color)} {room.get('name')} "
+            f"({room.get('members')} users)"
+        )
 
 
 def parse_args() -> tuple[str, int]:
@@ -373,7 +397,7 @@ def prompt_new_password() -> tuple[str, str]:
 def print_policy(policy: list[str]) -> None:
     if not policy:
         return
-    print("Password policy:")
+    print(styled("🔐 Password policy:", bold=True, color=ANSI_MAGENTA))
     for rule in policy:
         print(f"  - {rule}")
 
@@ -537,18 +561,25 @@ def main() -> None:
         msg_type = payload.get("type")
         timestamp = payload.get("timestamp", "")
         if msg_type == "welcome":
-            safe_print(f"[{timestamp}] Connected as {payload.get('username')} in room {payload.get('room')}")
+            safe_print(
+                styled(f"👋 [{timestamp}] Connected as {payload.get('username')} in room {payload.get('room')}", color=ANSI_CYAN)
+            )
             color = payload.get("color", "")
             if color:
-                safe_print(f"Your color: {color}{payload.get('color_name', '')}{ANSI_RESET}")
+                safe_print(f"🎨 Your color: {color}{payload.get('color_name', '')}{ANSI_RESET}")
             if payload.get("account_created"):
                 strength = payload.get("password_strength", {})
                 if strength:
                     safe_print(
-                        f"Password strength: {strength.get('bits', '?')} bits ({strength.get('label', '')})"
+                        f"✨ Password strength: {strength.get('bits', '?')} bits ({strength.get('label', '')})"
                     )
             print_room_list(payload.get("rooms", []))
-            safe_print("Commands: /rooms, /create <room> [password], /join <room> [password], /dm <username> <message>, /quit")
+            safe_print(
+                styled(
+                    "💡 Commands: /rooms, /create <room> [password], /join <room> [password], /dm <username> <message>, /quit",
+                    color=ANSI_YELLOW,
+                )
+            )
         elif msg_type == "room_list":
             print_room_list(payload.get("rooms", []))
         elif msg_type == "message":
@@ -562,8 +593,8 @@ def main() -> None:
                 try:
                     text = decrypt_text(ciphertext, message_key)
                 except ValueError:
-                    text = "<unable to decrypt message>"
-            safe_print(f"[{timestamp}] [{room}] {color}{sender}{ANSI_RESET}: {text}")
+                    text = "🔒 <unable to decrypt message>"
+            safe_print(f"💬 [{timestamp}] [{room}] {color}{sender}{ANSI_RESET}: {text}")
         elif msg_type == "peer_key":
             peer_username = str(payload.get("username", "")).strip()
             public_key = remember_peer_key_from_payload(peer_username, payload.get("public_key"))
@@ -572,71 +603,71 @@ def main() -> None:
             if event is not None:
                 event.set()
             if peer_username and public_key is None:
-                safe_print(f"Warning: invalid public key received for {peer_username}.")
+                safe_print(styled(f"⚠️ Warning: invalid public key received for {peer_username}.", color=ANSI_YELLOW))
         elif msg_type == "pair_key":
             sender = str(payload.get("from", "")).strip()
             encrypted_key_b64 = str(payload.get("encrypted_key", "")).strip()
             signature_b64 = str(payload.get("signature", "")).strip()
             sender_public_key = remember_peer_key_from_payload(sender, payload.get("public_key"))
             if not sender or not encrypted_key_b64 or not signature_b64:
-                safe_print("Warning: malformed pair key payload received.")
+                safe_print(styled("⚠️ Warning: malformed pair key payload received.", color=ANSI_YELLOW))
                 return
             if sender_public_key is None:
-                safe_print(f"Warning: missing sender public key for {sender}.")
+                safe_print(styled(f"⚠️ Warning: missing sender public key for {sender}.", color=ANSI_YELLOW))
                 return
             try:
                 signature = base64.b64decode(signature_b64, validate=True)
             except (ValueError, base64.binascii.Error):
-                safe_print(f"Warning: invalid key signature from {sender}.")
+                safe_print(styled(f"⚠️ Warning: invalid key signature from {sender}.", color=ANSI_YELLOW))
                 return
             if not rsa_verify_bytes(signed_blob("pair_key", sender, username, encrypted_key_b64), signature, sender_public_key):
-                safe_print(f"Warning: rejected key exchange from {sender} (invalid signature).")
+                safe_print(styled(f"⚠️ Warning: rejected key exchange from {sender} (invalid signature).", color=ANSI_YELLOW))
                 return
             try:
                 encrypted_key = base64.b64decode(encrypted_key_b64, validate=True)
                 key_material = rsa_decrypt_bytes(encrypted_key, private_key)
             except (ValueError, base64.binascii.Error):
-                safe_print(f"Warning: unable to decrypt key exchange from {sender}.")
+                safe_print(styled(f"⚠️ Warning: unable to decrypt key exchange from {sender}.", color=ANSI_YELLOW))
                 return
             if len(key_material) < MESSAGE_KEY_SIZE:
-                safe_print(f"Warning: rejected weak key exchange from {sender}.")
+                safe_print(styled(f"⚠️ Warning: rejected weak key exchange from {sender}.", color=ANSI_YELLOW))
                 return
             with state_lock:
                 peer_session_keys[sender] = key_material[:MESSAGE_KEY_SIZE]
-            safe_print(f"[{timestamp}] Secure DM session key established with {sender}.")
+            safe_print(styled(f"🤝 [{timestamp}] Secure DM session key established with {sender}.", color=ANSI_GREEN))
         elif msg_type == "direct_message":
             sender = str(payload.get("from", "")).strip()
             ciphertext = str(payload.get("ciphertext", "")).strip()
             signature_b64 = str(payload.get("signature", "")).strip()
             sender_public_key = remember_peer_key_from_payload(sender, payload.get("public_key"))
             if not sender or not ciphertext or not signature_b64:
-                safe_print("Warning: malformed direct message payload received.")
+                safe_print(styled("⚠️ Warning: malformed direct message payload received.", color=ANSI_YELLOW))
                 return
             if sender_public_key is None:
-                safe_print(f"Warning: missing sender public key for {sender}.")
+                safe_print(styled(f"⚠️ Warning: missing sender public key for {sender}.", color=ANSI_YELLOW))
                 return
             try:
                 signature = base64.b64decode(signature_b64, validate=True)
             except (ValueError, base64.binascii.Error):
-                safe_print(f"Warning: invalid signature encoding from {sender}.")
+                safe_print(styled(f"⚠️ Warning: invalid signature encoding from {sender}.", color=ANSI_YELLOW))
                 return
             if not rsa_verify_bytes(signed_blob("direct_message", sender, username, ciphertext), signature, sender_public_key):
-                safe_print(f"Warning: rejected direct message from {sender} (invalid signature).")
+                safe_print(styled(f"⚠️ Warning: rejected direct message from {sender} (invalid signature).", color=ANSI_YELLOW))
                 return
             with state_lock:
                 dm_key = peer_session_keys.get(sender)
             if dm_key is None:
-                safe_print(f"Warning: no DM session key for {sender}; message rejected.")
+                safe_print(styled(f"⚠️ Warning: no DM session key for {sender}; message rejected.", color=ANSI_YELLOW))
                 return
             try:
                 text = decrypt_text(ciphertext, dm_key)
             except ValueError:
-                safe_print(f"Warning: unable to decrypt direct message from {sender}.")
+                safe_print(styled(f"⚠️ Warning: unable to decrypt direct message from {sender}.", color=ANSI_YELLOW))
                 return
-            safe_print(f"[{timestamp}] [DM] {sender}: {text}")
+            safe_print(styled(f"📩 [{timestamp}] [DM] {sender}: {text}", color=ANSI_MAGENTA))
         elif msg_type == "system":
             room = payload.get("room", "")
-            safe_print(f"[{timestamp}] [{room}] {payload.get('message', '')}")
+            safe_print(styled(f"🛎️ [{timestamp}] [{room}] {payload.get('message', '')}", color=ANSI_CYAN))
         elif msg_type == "error":
             error_message = str(payload.get("message", ""))
             match = re.fullmatch(r"user '([^']+)' is not online", error_message)
@@ -647,9 +678,9 @@ def main() -> None:
                     event = pending_key_events.get(offline_peer)
                 if event is not None:
                     event.set()
-            safe_print(f"Error: {error_message}")
+            safe_print(styled(f"⛔ Error: {error_message}", color=ANSI_RED))
         elif msg_type == "goodbye":
-            safe_print("Disconnected.")
+            safe_print(styled("👋 Disconnected.", color=ANSI_CYAN))
             stop_event.set()
         else:
             safe_print(json.dumps(payload, ensure_ascii=False))
@@ -690,7 +721,11 @@ def main() -> None:
                     continue
                 if command in {"create", "join"}:
                     if len(parts) < 2:
-                        print("Usage: /create <room> [password]" if command == "create" else "Usage: /join <room> [password]")
+                        print(
+                            styled("Usage: /create <room> [password]", color=ANSI_YELLOW)
+                            if command == "create"
+                            else styled("Usage: /join <room> [password]", color=ANSI_YELLOW)
+                        )
                         continue
                     room = parts[1]
                     password = parts[2] if len(parts) == 3 else None
@@ -707,15 +742,15 @@ def main() -> None:
                     continue
                 if command == "dm":
                     if len(parts) < 3:
-                        print("Usage: /dm <username> <message>")
+                        print(styled("Usage: /dm <username> <message>", color=ANSI_YELLOW))
                         continue
                     peer_username = parts[1].strip()
                     plaintext = parts[2]
                     if not peer_username:
-                        print("Usage: /dm <username> <message>")
+                        print(styled("Usage: /dm <username> <message>", color=ANSI_YELLOW))
                         continue
                     if peer_username == username:
-                        print("You cannot DM yourself.")
+                        print(styled("⚠️ You cannot DM yourself.", color=ANSI_YELLOW))
                         continue
 
                     with state_lock:
@@ -723,13 +758,13 @@ def main() -> None:
                     if dm_key is None:
                         peer_public_key = request_peer_key(peer_username)
                         if peer_public_key is None:
-                            print(f"Unable to fetch public key for '{peer_username}'.")
+                            print(styled(f"⚠️ Unable to fetch public key for '{peer_username}'.", color=ANSI_YELLOW))
                             continue
                         dm_key = os.urandom(MESSAGE_KEY_SIZE)
                         try:
                             encrypted_key = rsa_encrypt_bytes(dm_key, peer_public_key)
                         except ValueError:
-                            print(f"Failed to encrypt a DM key for '{peer_username}'.")
+                            print(styled(f"⚠️ Failed to encrypt a DM key for '{peer_username}'.", color=ANSI_YELLOW))
                             continue
                         encrypted_key_b64 = base64.b64encode(encrypted_key).decode("ascii")
                         key_signature = rsa_sign_bytes(
@@ -762,7 +797,12 @@ def main() -> None:
                         )
                     )
                     continue
-                print("Commands: /rooms, /create <room> [password], /join <room> [password], /dm <username> <message>, /quit")
+                print(
+                    styled(
+                        "💡 Commands: /rooms, /create <room> [password], /join <room> [password], /dm <username> <message>, /quit",
+                        color=ANSI_YELLOW,
+                    )
+                )
             else:
                 sock.sendall(json_line({"type": "message", "ciphertext": encrypt_text(line, message_key)}))
     except (BrokenPipeError, OSError):

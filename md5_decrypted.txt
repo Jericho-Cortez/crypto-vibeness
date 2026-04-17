@@ -4,9 +4,27 @@ Mot de passe MD5 récupéré
 Hash : 35b95f7c0f63631c453220fb2a86f218
 
 Commande utilisée :
-hashcat --show -m 0 md5_yolo.txt
+hashcat -m 0 -a 3 hashes.txt '?u?u?l?l?u?u?s'
 
 Résultat :
 35b95f7c0f63631c453220fb2a86f218:CMrsBB!
 
 Statut : cassé
+
+Étapes :
+1. Récupérer le hash brut dans md5_yolo.txt.
+2. Lancer Hashcat en mode MD5 avec une attaque par masque.
+3. Attendre que Hashcat casse le mot de passe.
+4. Afficher le résultat avec `hashcat -m 0 --show hashes.txt`.
+
+Détail des options Hashcat :
+- `-m 0` : indique le type de hash, ici MD5.
+- `-a 3` : lance une attaque par masque, donc Hashcat teste des combinaisons selon un modèle donné.
+- `hashes.txt` : fichier qui contient les hashes à attaquer.
+- `'?u?u?l?l?u?u?s'` : masque utilisé pour générer les essais.
+  - `?u` = majuscule
+  - `?l` = minuscule
+  - `?s` = caractère spécial
+
+Pour afficher seulement les hashes déjà cassés :
+`hashcat -m 0 --show hashes.txt`
